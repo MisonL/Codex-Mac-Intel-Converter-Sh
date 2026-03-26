@@ -35,7 +35,8 @@ Or:
 
 ## Output
 
-- `CodexAppMacIntel.dmg` — rebuilt Intel-targeted output
+- `CodexAppMacIntel_<原始版本>_x64_<YYYYMMDD>.dmg` — rebuilt Intel-targeted output
+- `CodexAppMacIntelBuilder_<原始版本>_x64_<YYYYMMDD>.zip` — release bundle containing `build-intel.sh`, `README.md`, `package.json`, `.gitignore`
 - `log.txt` — full build log
 - `.tmp/` — temporary build workspace
 

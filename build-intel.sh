@@ -6,10 +6,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PARENT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TMP_BASE="${SCRIPT_DIR}/.tmp"
 LOG_FILE="${SCRIPT_DIR}/log.txt"
-OUTPUT_DMG="${SCRIPT_DIR}/CodexAppMacIntel.dmg"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RELEASE_DATE="$(date +%Y%m%d)"
 WORK_DIR="${TMP_BASE}/codex_intel_build_${RUN_ID}"
 MOUNT_POINT="${WORK_DIR}/mount"
+OUTPUT_DMG_PREFIX="CodexAppMacIntel"
+SCRIPT_PACKAGE_PREFIX="CodexAppMacIntelBuilder"
+TARGET_ARCH_LABEL="x64"
+
+OUTPUT_DMG=""
+SCRIPT_RELEASE_ARCHIVE=""
+RELEASE_BASENAME=""
+APP_VERSION=""
 
 # Runtime flags/state used by cleanup and mount logic.
 ATTACHED_BY_SCRIPT=0
@@ -28,6 +36,44 @@ die() {
   exit 1
 }
 
+plist_get() {
+  local plist_file="$1"
+  local plist_key="$2"
+
+  /usr/libexec/PlistBuddy -c "Print :${plist_key}" "${plist_file}" 2>/dev/null
+}
+
+sanitize_filename_component() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '_'
+}
+
+find_mounted_app_for_image() {
+  local image_path="$1"
+
+  hdiutil info | awk -v image="${image_path}" '
+    /^================================================$/ {
+      if (matched) {
+        exit
+      }
+      matched = 0
+      next
+    }
+    $1 == "image-path" {
+      current = substr($0, index($0, ":") + 2)
+      matched = (current == image)
+      next
+    }
+    matched && $1 ~ /^\/dev\// && NF >= 3 {
+      mount_path = $0
+      sub(/^([^[:space:]]+[[:space:]]+){2}/, "", mount_path)
+      if (mount_path != "") {
+        print mount_path "/Codex.app"
+        exit
+      }
+    }
+  '
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -38,7 +84,7 @@ Behavior:
   - Never modifies the original DMG
   - Uses .tmp/* for all build steps
   - Writes full logs to log.txt
-  - Produces CodexAppMacIntel.dmg
+  - Produces release-named DMG and script bundle artifacts
 EOF
 }
 
@@ -93,7 +139,11 @@ else
   if [[ -f "${SCRIPT_PARENT_DIR}/Codex.dmg" ]]; then
     INPUT_DMG="${SCRIPT_PARENT_DIR}/Codex.dmg"
   else
-    mapfile -t found_dmgs < <(find "${SCRIPT_PARENT_DIR}" -maxdepth 1 -type f -name "*.dmg" ! -name "$(basename "${OUTPUT_DMG}")" | sort)
+    mapfile -t found_dmgs < <(
+      find "${SCRIPT_PARENT_DIR}" -maxdepth 1 -type f -name "*.dmg" \
+        ! -name "${OUTPUT_DMG_PREFIX}.dmg" \
+        ! -name "${OUTPUT_DMG_PREFIX}_*.dmg" | sort
+    )
     if [[ ${#found_dmgs[@]} -eq 0 ]]; then
       die "No source DMG found. Put Codex.dmg next to this repo folder (../Codex.dmg) or pass a path."
     fi
@@ -115,7 +165,10 @@ if hdiutil attach -readonly -nobrowse -mountpoint "${MOUNT_POINT}" "${INPUT_DMG}
   ATTACHED_BY_SCRIPT=1
   SOURCE_APP="${MOUNT_POINT}/Codex.app"
 else
-  if [[ -d "/Volumes/Codex Installer/Codex.app" ]]; then
+  SOURCE_APP="$(find_mounted_app_for_image "${INPUT_DMG}" || true)"
+  if [[ -d "${SOURCE_APP}" ]]; then
+    log "Using existing mounted app: ${SOURCE_APP}"
+  elif [[ -d "/Volumes/Codex Installer/Codex.app" ]]; then
     SOURCE_APP="/Volumes/Codex Installer/Codex.app"
     log "Using existing mounted volume: ${SOURCE_APP}"
   else
@@ -128,14 +181,31 @@ ORIG_APP="${WORK_DIR}/CodexOriginal.app"
 TARGET_APP="${WORK_DIR}/Codex.app"
 BUILD_PROJECT="${WORK_DIR}/build-project"
 DMG_ROOT="${WORK_DIR}/dmg-root"
+SCRIPT_RELEASE_DIR=""
 
 # Copy app bundle from mounted DMG to local writable work dir.
 log "Copying source app bundle to work dir"
 ditto "${SOURCE_APP}" "${ORIG_APP}"
 
+APP_INFO_PLIST="${ORIG_APP}/Contents/Info.plist"
+[[ -f "${APP_INFO_PLIST}" ]] || die "Cannot read source app info plist"
+APP_VERSION_RAW="$(plist_get "${APP_INFO_PLIST}" "CFBundleShortVersionString" || true)"
+if [[ -z "${APP_VERSION_RAW}" ]]; then
+  APP_VERSION_RAW="$(plist_get "${APP_INFO_PLIST}" "CFBundleVersion" || true)"
+fi
+[[ -n "${APP_VERSION_RAW}" ]] || die "Cannot detect source app version"
+APP_VERSION="$(sanitize_filename_component "${APP_VERSION_RAW}")"
+[[ -n "${APP_VERSION}" ]] || die "Cannot sanitize source app version for release name"
+RELEASE_BASENAME="${APP_VERSION}_${TARGET_ARCH_LABEL}_${RELEASE_DATE}"
+OUTPUT_DMG="${SCRIPT_DIR}/${OUTPUT_DMG_PREFIX}_${RELEASE_BASENAME}.dmg"
+SCRIPT_RELEASE_ARCHIVE="${SCRIPT_DIR}/${SCRIPT_PACKAGE_PREFIX}_${RELEASE_BASENAME}.zip"
+SCRIPT_RELEASE_DIR="${WORK_DIR}/release-scripts/${SCRIPT_PACKAGE_PREFIX}_${RELEASE_BASENAME}"
+log "Detected source app version: ${APP_VERSION_RAW}"
+log "Release basename: ${RELEASE_BASENAME}"
+
 FRAMEWORK_INFO="${ORIG_APP}/Contents/Frameworks/Electron Framework.framework/Versions/A/Resources/Info.plist"
 [[ -f "${FRAMEWORK_INFO}" ]] || die "Cannot read Electron framework info plist"
-ELECTRON_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "${FRAMEWORK_INFO}" 2>/dev/null || true)"
+ELECTRON_VERSION="$(plist_get "${FRAMEWORK_INFO}" "CFBundleVersion" || true)"
 [[ -n "${ELECTRON_VERSION}" ]] || die "Cannot detect Electron version from source app"
 
 ASAR_FILE="${ORIG_APP}/Contents/Resources/app.asar"
@@ -276,7 +346,18 @@ ditto "${TARGET_APP}" "${DMG_ROOT}/Codex.app"
 ln -s /Applications "${DMG_ROOT}/Applications"
 hdiutil create -volname "Codex App Mac Intel" -srcfolder "${DMG_ROOT}" -ov -format UDZO "${OUTPUT_DMG}" >/dev/null
 
+# Package the release script set with matching version/date naming.
+log "Packaging release scripts: ${SCRIPT_RELEASE_ARCHIVE}"
+rm -f "${SCRIPT_RELEASE_ARCHIVE}"
+mkdir -p "${SCRIPT_RELEASE_DIR}"
+install -m 755 "${SCRIPT_DIR}/build-intel.sh" "${SCRIPT_RELEASE_DIR}/build-intel.sh"
+cp "${SCRIPT_DIR}/README.md" "${SCRIPT_RELEASE_DIR}/README.md"
+cp "${SCRIPT_DIR}/package.json" "${SCRIPT_RELEASE_DIR}/package.json"
+cp "${SCRIPT_DIR}/.gitignore" "${SCRIPT_RELEASE_DIR}/.gitignore"
+ditto -c -k --sequesterRsrc --keepParent "${SCRIPT_RELEASE_DIR}" "${SCRIPT_RELEASE_ARCHIVE}"
+
 log "Done"
 log "Output DMG: ${OUTPUT_DMG}"
+log "Script bundle: ${SCRIPT_RELEASE_ARCHIVE}"
 log "Build log: ${LOG_FILE}"
 log "Work dir: ${WORK_DIR}"
