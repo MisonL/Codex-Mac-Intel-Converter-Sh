@@ -2,14 +2,14 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEFAULT_BUILD_ROOT="${REPO_ROOT}/.tmp/codex_intel_build_20260326_212136"
+DEFAULT_BUILD_ROOT="$(find "${REPO_ROOT}/.tmp" -maxdepth 1 -type d -name 'codex_intel_build_*' | sort | tail -n 1)"
+DEFAULT_BUILD_ROOT="${DEFAULT_BUILD_ROOT:-${REPO_ROOT}/.tmp/codex_intel_build_latest}"
 BUILD_ROOT="${BUILD_ROOT:-${DEFAULT_BUILD_ROOT}}"
 ELECTRON_APP="${BUILD_ROOT}/build-project/node_modules/electron/dist/Electron.app"
 CONVERTED_APP="${BUILD_ROOT}/Codex.app"
-ORIGINAL_APP_CANDIDATES=(
-  "/private/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/MgnrJQ/Codex.app"
-  "/Volumes/Codex Installer/Codex.app"
-)
+ORIGINAL_APP_CANDIDATES_DEFAULT="/Volumes/Codex Installer/Codex.app"
+ORIGINAL_APP_CANDIDATES_ENV="${ORIGINAL_APP_CANDIDATES_ENV:-${ORIGINAL_APP_CANDIDATES_DEFAULT}}"
+IFS=':' read -r -a ORIGINAL_APP_CANDIDATES <<< "${ORIGINAL_APP_CANDIDATES_ENV}"
 
 find_original_app() {
   local app_path=""
@@ -45,7 +45,7 @@ run_packaged_probe() {
   "main": "main.js"
 }
 EOF
-  TEST_ROOT_VALUE="${test_root}" cat > "${test_root}/${app_copy_name}/Contents/Resources/app/main.js" <<'EOF'
+  cat > "${test_root}/${app_copy_name}/Contents/Resources/app/main.js" <<'EOF'
 const { app } = require('electron');
 const fs = require('fs');
 const path = require('path');

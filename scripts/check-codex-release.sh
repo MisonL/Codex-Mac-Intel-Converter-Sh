@@ -23,6 +23,10 @@ LAST_CHECKED_AT_UTC=""
 LAST_ACTION=""
 ATTACHED_BY_SCRIPT=0
 
+log() {
+  printf '[%s] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*"
+}
+
 derive_github_repository() {
   local remote_url=""
   local derived_repo=""
@@ -77,6 +81,7 @@ EOF
 load_state() {
   # shellcheck disable=SC1090
   source "${STATE_FILE}"
+  log "Loaded state: version=${LAST_SEEN_VERSION:-<empty>} action=${LAST_ACTION:-<empty>} checked_at=${LAST_CHECKED_AT_UTC:-<empty>}"
 }
 
 persist_state() {
