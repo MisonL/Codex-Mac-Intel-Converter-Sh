@@ -13,7 +13,8 @@ MOUNT_POINT="${WORK_DIR}/mount"
 OUTPUT_DMG_PREFIX="CodexAppMacIntel"
 SCRIPT_PACKAGE_PREFIX="CodexAppMacIntelBuilder"
 TARGET_ARCH_LABEL="x64"
-GITHUB_RELEASE_REPO="${GITHUB_RELEASE_REPO:-MisonL/Codex-Mac-Intel-Converter-Sh}"
+GITHUB_RELEASE_REPO="${GITHUB_RELEASE_REPO:-}"
+DEFAULT_GITHUB_RELEASE_REPO="MisonL/Codex-Mac-Intel-Converter-Sh"
 
 OUTPUT_DMG=""
 SCRIPT_RELEASE_ARCHIVE=""
@@ -21,6 +22,7 @@ RELEASE_BASENAME=""
 APP_VERSION=""
 APP_EXECUTABLE=""
 APP_BUNDLE_ID=""
+PATCH_SCRIPT_PATH=""
 
 # Runtime flags/state used by cleanup and mount logic.
 ATTACHED_BY_SCRIPT=0
@@ -48,6 +50,49 @@ plist_get() {
 
 sanitize_filename_component() {
   printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '_'
+}
+
+resolve_patch_script_path() {
+  local candidate=""
+
+  for candidate in \
+    "${SCRIPT_DIR}/scripts/patch-codex-desktop.mjs" \
+    "${SCRIPT_DIR}/patch-codex-desktop.mjs"; do
+    if [[ -f "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+derive_github_release_repo() {
+  local remote_url=""
+  local derived_repo=""
+
+  if [[ -n "${GITHUB_RELEASE_REPO}" ]]; then
+    printf '%s\n' "${GITHUB_RELEASE_REPO}"
+    return 0
+  fi
+
+  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+    printf '%s\n' "${GITHUB_REPOSITORY}"
+    return 0
+  fi
+
+  if command -v git >/dev/null 2>&1; then
+    remote_url="$(git -C "${SCRIPT_DIR}" remote get-url origin 2>/dev/null || true)"
+  fi
+  if [[ -n "${remote_url}" ]]; then
+    derived_repo="$(printf '%s' "${remote_url}" | sed -E 's#(git@github\.com:|https://github\.com/)##; s#\.git$##')"
+    if [[ "${derived_repo}" == */* ]]; then
+      printf '%s\n' "${derived_repo}"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "${DEFAULT_GITHUB_RELEASE_REPO}"
 }
 
 upsert_plist_string() {
@@ -146,6 +191,10 @@ log "Script dir: ${SCRIPT_DIR}"
 log "Default source location: ${SCRIPT_PARENT_DIR}/Codex.dmg"
 log "Work dir: ${WORK_DIR}"
 mkdir -p "${WORK_DIR}"
+PATCH_SCRIPT_PATH="$(resolve_patch_script_path || true)"
+[[ -n "${PATCH_SCRIPT_PATH}" ]] || die "Cannot locate patch-codex-desktop.mjs next to build-intel.sh"
+GITHUB_RELEASE_REPO="$(derive_github_release_repo)"
+log "GitHub release repo: ${GITHUB_RELEASE_REPO}"
 
 # Validate required tools early.
 for cmd in hdiutil ditto npm npx node file codesign xattr; do
@@ -324,7 +373,7 @@ log "Patching packaged desktop bundle for GitHub release updates"
 ASAR_EXTRACT_DIR="${WORK_DIR}/asar-app"
 rm -rf "${ASAR_EXTRACT_DIR}"
 npx --yes @electron/asar extract "${TARGET_APP}/Contents/Resources/app.asar" "${ASAR_EXTRACT_DIR}"
-node "${SCRIPT_DIR}/scripts/patch-codex-desktop.mjs" \
+node "${PATCH_SCRIPT_PATH}" \
   "${ASAR_EXTRACT_DIR}" \
   "${GITHUB_RELEASE_REPO}" \
   "v${APP_VERSION}-${TARGET_ARCH_LABEL}-${RELEASE_DATE}" \

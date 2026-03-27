@@ -1,19 +1,16 @@
-name: Weekly Codex Intel Release
+name: Codex Intel Release Check
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - cse/validate-release-updater
   schedule:
-    - cron: '0 9 * * 1'
+    - cron: '0 9 * * *'
       timezone: 'Asia/Shanghai'
 
 permissions:
   contents: write
 
 concurrency:
-  group: weekly-codex-intel-release
+  group: codex-intel-release-check
   cancel-in-progress: false
 
 jobs:

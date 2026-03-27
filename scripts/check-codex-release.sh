@@ -7,8 +7,9 @@ TMP_BASE="${REPO_ROOT}/.tmp/release-check"
 STATE_FILE="${STATE_FILE:-${REPO_ROOT}/.github/codex-release-state.env}"
 HISTORY_FILE="${HISTORY_FILE:-${REPO_ROOT}/docs/release-checks/history.tsv}"
 SOURCE_DMG_URL="${SOURCE_DMG_URL:-https://persistent.oaistatic.com/codex-app-prod/Codex.dmg}"
-GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-MisonL/Codex-Mac-Intel-Converter-Sh}"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}"
 TARGET_ARCH_LABEL="x64"
+RELEASE_TARGET_REF="${RELEASE_TARGET_REF:-main}"
 RUN_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RELEASE_DATE="$(date +%Y%m%d)"
 WORK_DIR="${TMP_BASE}/${RELEASE_DATE}_$(date +%H%M%S)"
@@ -21,6 +22,30 @@ LAST_RELEASE_TAG=""
 LAST_CHECKED_AT_UTC=""
 LAST_ACTION=""
 ATTACHED_BY_SCRIPT=0
+
+derive_github_repository() {
+  local remote_url=""
+  local derived_repo=""
+
+  if [[ -n "${GITHUB_REPOSITORY}" ]]; then
+    printf '%s\n' "${GITHUB_REPOSITORY}"
+    return 0
+  fi
+
+  if command -v git >/dev/null 2>&1; then
+    remote_url="$(git -C "${REPO_ROOT}" remote get-url origin 2>/dev/null || true)"
+  fi
+  if [[ -n "${remote_url}" ]]; then
+    derived_repo="$(printf '%s' "${remote_url}" | sed -E 's#(git@github\.com:|https://github\.com/)##; s#\.git$##')"
+    if [[ "${derived_repo}" == */* ]]; then
+      printf '%s\n' "${derived_repo}"
+      return 0
+    fi
+  fi
+
+  echo "Cannot determine GitHub repository. Set GITHUB_REPOSITORY or configure origin." >&2
+  return 1
+}
 
 emit_output() {
   local key="$1"
@@ -152,7 +177,7 @@ EOF
   gh release create "${release_tag}" \
     "${REPO_ROOT}/${dmg_name}" \
     "${REPO_ROOT}/${zip_name}" \
-    --target "${GITHUB_REF_NAME:-main}" \
+    --target "${RELEASE_TARGET_REF}" \
     --title "${title}" \
     --notes-file "${notes_file}"
 }
@@ -166,28 +191,27 @@ main() {
   local note=""
 
   ensure_tracking_files
+  GITHUB_REPOSITORY="$(derive_github_repository)"
   load_state
   source_sha256="$(download_source_dmg)"
   source_version="$(read_source_version)"
   release_tag="v${source_version}-${TARGET_ARCH_LABEL}-${RELEASE_DATE}"
+  existing_release_tag="$(find_existing_release_for_version "${source_version}" || true)"
   emit_output "source_version" "${source_version}"
   emit_output "release_tag" "${release_tag}"
 
-  if [[ "${source_version}" == "${LAST_SEEN_VERSION}" && "${source_sha256}" == "${LAST_SEEN_SHA256}" ]]; then
+  if [[ -n "${existing_release_tag}" ]]; then
+    action="no_update"
+    note="existing_release_found:${existing_release_tag}"
+    release_tag="${existing_release_tag}"
+  elif [[ "${source_version}" == "${LAST_SEEN_VERSION}" && "${source_sha256}" == "${LAST_SEEN_SHA256}" ]]; then
     action="no_update"
     note="same_version_and_sha"
     release_tag="${LAST_RELEASE_TAG}"
   else
-    existing_release_tag="$(find_existing_release_for_version "${source_version}" || true)"
-    if [[ -n "${existing_release_tag}" && -z "${LAST_SEEN_VERSION}" ]]; then
-      action="no_update"
-      note="bootstrap_synced_from_existing_release:${existing_release_tag}"
-      release_tag="${existing_release_tag}"
-    else
-      action="released"
-      note="new_upstream_artifact"
-      create_release "${source_version}" "${source_sha256}" "${release_tag}"
-    fi
+    action="released"
+    note="new_upstream_artifact"
+    create_release "${source_version}" "${source_sha256}" "${release_tag}"
   fi
 
   persist_state "${source_version}" "${source_sha256}" "${release_tag}" "${action}"

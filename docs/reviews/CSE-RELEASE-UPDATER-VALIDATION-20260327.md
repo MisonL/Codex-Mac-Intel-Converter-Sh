@@ -11,7 +11,8 @@
   - 不修改 `main` 已发布 release
   - 不用推测替代代码证据和实验结果
 - Boundary:
-  - 只做离线验证，不引入新的发布资产或线上更新源
+  - 初始阶段只做离线验证
+  - 后续追加一次受控的 GitHub Actions 线上验证，但不在验证分支发正式 release
 
 ## Plant / Sensors / Error
 
@@ -58,3 +59,52 @@
 - 正确的下一层控制输入应是：
   - 先把 Intel 转换产物重构为真正 packaged 的 `Codex.app`
   - 再决定是否补回 x64 Sparkle 原生模块和 appcast 发布链路
+
+## Implementation Validation
+
+1. 已把 Intel 转换流程切到 packaged 壳，并把更新源切到 GitHub Release。
+   - [build-intel.sh](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/build-intel.sh#L305) 到 [build-intel.sh](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/build-intel.sh#L334) 会把 Electron x64 runtime 重命名成 `Codex.app/Contents/MacOS/Codex`，同步重命名 helper app，并在 `app.asar` 内注入 GitHub release updater 元数据和逻辑。
+   - [scripts/patch-codex-desktop.mjs](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/scripts/patch-codex-desktop.mjs#L98) 到 [scripts/patch-codex-desktop.mjs](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/scripts/patch-codex-desktop.mjs#L206) 会：
+     - 把 `"Install Update"` 改成 `"Download Update"`
+     - 向 `package.json` 注入 `codexIntelReleaseRepo`、`codexIntelReleaseTag`、`codexIntelReleaseDate`、`codexIntelAssetName`、`codexIntelArch`
+     - 按 bundle 特征自动识别旧版 `deeplinks-*.js` 和新版 `product-name-*.js`
+     - 用 GitHub latest release 查询逻辑替换原 Sparkle native updater 方法段
+
+2. 已修正两个真实实现缺陷。
+   - `deeplinks` 补丁边界原本截到 `resolveIntervalMs()`，会生成重复方法定义，导致主进程 JS 语法损坏；现在改为截到 `buildDiagnostics()` 前。
+   - [build-intel.sh](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/build-intel.sh#L175) 到 [build-intel.sh](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/build-intel.sh#L182) 去掉了 `mapfile`，改成 Bash 3.2 兼容写法，避免 macOS 默认 `/bin/bash` 直接失败。
+   - [scripts/check-codex-release.sh](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/scripts/check-codex-release.sh#L112) 到 [scripts/check-codex-release.sh](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/scripts/check-codex-release.sh#L126) 已修正已有 release 查询的 stdin 覆盖问题，避免状态文件缺失时错误重发 release。
+
+3. 2026-03-27 当次构建和验证已通过。
+   - 验证结果：
+     - `node --check` 通过：
+       - `bootstrap.js`
+       - `deeplinks-D8FzxbSB.js`
+     - `package.json` 中已写入：
+       - `codexBuildFlavor=prod`
+       - `codexIntelReleaseRepo=MisonL/Codex-Mac-Intel-Converter-Sh`
+       - `codexIntelReleaseTag=v26.324.21641-x64-20260327`
+       - `codexIntelAssetName=CodexAppMacIntel_26.324.21641_x64_20260327.dmg`
+     - helper app 名称和主可执行文件名已对齐 `Codex`
+     - `BUILD_ROOT=/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/.tmp/codex_intel_build_20260327_200842 ./scripts/validate-release-updater.sh` 输出：
+       - 默认 `Electron` 壳 => `isPackaged: false`
+       - 重命名 `Codex` 壳 => `isPackaged: true`
+
+4. 同日已完成对最新上游版本和 GitHub Actions 的追加验证。
+   - 最新实测上游版本：`26.325.21211`
+   - 结果：
+     - 新版上游 `app.asar` 不再包含 `deeplinks-*.js`，而是把 updater 逻辑收敛到 `product-name-*.js`
+     - 当前补丁器已能同时兼容旧版和新版结构
+     - `node --check` 已通过新版工作目录里的 `.vite/build/*.js`
+
+5. GitHub Actions 真实跑通。
+   - 工作流文件：
+     - [.github/workflows/codex-release-check.yml](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/.github/workflows/codex-release-check.yml)
+   - 当前调度：
+     - 每天 `09:00` `Asia/Shanghai`
+   - 真实运行：
+     - Run ID: `23646890570`
+     - Conclusion: `success`
+   - 说明：
+     - 这次运行仅用于验证 workflow 能成功完成
+     - 合入 `main` 前已移除验证分支专用 `push` 触发和种子状态
