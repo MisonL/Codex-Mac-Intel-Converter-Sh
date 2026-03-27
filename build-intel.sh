@@ -13,11 +13,14 @@ MOUNT_POINT="${WORK_DIR}/mount"
 OUTPUT_DMG_PREFIX="CodexAppMacIntel"
 SCRIPT_PACKAGE_PREFIX="CodexAppMacIntelBuilder"
 TARGET_ARCH_LABEL="x64"
+GITHUB_RELEASE_REPO="${GITHUB_RELEASE_REPO:-MisonL/Codex-Mac-Intel-Converter-Sh}"
 
 OUTPUT_DMG=""
 SCRIPT_RELEASE_ARCHIVE=""
 RELEASE_BASENAME=""
 APP_VERSION=""
+APP_EXECUTABLE=""
+APP_BUNDLE_ID=""
 
 # Runtime flags/state used by cleanup and mount logic.
 ATTACHED_BY_SCRIPT=0
@@ -45,6 +48,36 @@ plist_get() {
 
 sanitize_filename_component() {
   printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '_'
+}
+
+upsert_plist_string() {
+  local plist_file="$1"
+  local plist_key="$2"
+  local plist_value="$3"
+
+  /usr/libexec/PlistBuddy -c "Set :${plist_key} ${plist_value}" "${plist_file}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :${plist_key} string ${plist_value}" "${plist_file}" >/dev/null
+}
+
+rename_helper_app() {
+  local old_name="$1"
+  local new_name="$2"
+  local bundle_id_suffix="$3"
+  local old_app="${TARGET_APP}/Contents/Frameworks/${old_name}.app"
+  local new_app="${TARGET_APP}/Contents/Frameworks/${new_name}.app"
+  local helper_plist=""
+
+  [[ -d "${old_app}" ]] || die "Helper app not found: ${old_app}"
+  mv "${old_app}" "${new_app}"
+  if [[ -f "${new_app}/Contents/MacOS/${old_name}" ]]; then
+    mv "${new_app}/Contents/MacOS/${old_name}" "${new_app}/Contents/MacOS/${new_name}"
+  fi
+
+  helper_plist="${new_app}/Contents/Info.plist"
+  upsert_plist_string "${helper_plist}" "CFBundleExecutable" "${new_name}"
+  upsert_plist_string "${helper_plist}" "CFBundleName" "${new_name}"
+  upsert_plist_string "${helper_plist}" "CFBundleDisplayName" "${new_name}"
+  upsert_plist_string "${helper_plist}" "CFBundleIdentifier" "${APP_BUNDLE_ID}.${bundle_id_suffix}"
 }
 
 find_mounted_app_for_image() {
@@ -139,7 +172,10 @@ else
   if [[ -f "${SCRIPT_PARENT_DIR}/Codex.dmg" ]]; then
     INPUT_DMG="${SCRIPT_PARENT_DIR}/Codex.dmg"
   else
-    mapfile -t found_dmgs < <(
+    found_dmgs=()
+    while IFS= read -r found_dmg; do
+      found_dmgs+=("${found_dmg}")
+    done < <(
       find "${SCRIPT_PARENT_DIR}" -maxdepth 1 -type f -name "*.dmg" \
         ! -name "${OUTPUT_DMG_PREFIX}.dmg" \
         ! -name "${OUTPUT_DMG_PREFIX}_*.dmg" | sort
@@ -194,6 +230,10 @@ if [[ -z "${APP_VERSION_RAW}" ]]; then
   APP_VERSION_RAW="$(plist_get "${APP_INFO_PLIST}" "CFBundleVersion" || true)"
 fi
 [[ -n "${APP_VERSION_RAW}" ]] || die "Cannot detect source app version"
+APP_EXECUTABLE="$(plist_get "${APP_INFO_PLIST}" "CFBundleExecutable" || true)"
+[[ -n "${APP_EXECUTABLE}" ]] || die "Cannot detect source app executable name"
+APP_BUNDLE_ID="$(plist_get "${APP_INFO_PLIST}" "CFBundleIdentifier" || true)"
+[[ -n "${APP_BUNDLE_ID}" ]] || die "Cannot detect source app bundle identifier"
 APP_VERSION="$(sanitize_filename_component "${APP_VERSION_RAW}")"
 [[ -n "${APP_VERSION}" ]] || die "Cannot sanitize source app version for release name"
 RELEASE_BASENAME="${APP_VERSION}_${TARGET_ARCH_LABEL}_${RELEASE_DATE}"
@@ -262,16 +302,36 @@ EOF
 log "Creating Intel app bundle from Electron runtime"
 ditto "${BUILD_PROJECT}/node_modules/electron/dist/Electron.app" "${TARGET_APP}"
 
-# Inject original Codex app resources into the x64 runtime shell.
+# Convert the default Electron runtime shell into a packaged Codex app shell.
+log "Renaming Electron runtime shell to ${APP_EXECUTABLE}"
+mv "${TARGET_APP}/Contents/MacOS/Electron" "${TARGET_APP}/Contents/MacOS/${APP_EXECUTABLE}"
+rename_helper_app "Electron Helper" "${APP_EXECUTABLE} Helper" "helper"
+rename_helper_app "Electron Helper (Renderer)" "${APP_EXECUTABLE} Helper (Renderer)" "helper.renderer"
+rename_helper_app "Electron Helper (GPU)" "${APP_EXECUTABLE} Helper (GPU)" "helper.gpu"
+rename_helper_app "Electron Helper (Plugin)" "${APP_EXECUTABLE} Helper (Plugin)" "helper.plugin"
+
+# Inject original Codex metadata and resources into the packaged x64 runtime shell.
 log "Injecting Codex resources from original app"
 rm -rf "${TARGET_APP}/Contents/Resources"
 ditto "${ORIG_APP}/Contents/Resources" "${TARGET_APP}/Contents/Resources"
 cp "${ORIG_APP}/Contents/Info.plist" "${TARGET_APP}/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleExecutable Electron" "${TARGET_APP}/Contents/Info.plist" >/dev/null
-# Codex main process treats isPackaged=false as dev and tries localhost:5175.
-# Force renderer URL to bundled app protocol in this transplanted runtime.
+# Keep the packaged renderer on bundled assets even after switching the runtime shell.
 /usr/libexec/PlistBuddy -c "Add :LSEnvironment:ELECTRON_RENDERER_URL string app://-/index.html" "${TARGET_APP}/Contents/Info.plist" >/dev/null 2>&1 || \
   /usr/libexec/PlistBuddy -c "Set :LSEnvironment:ELECTRON_RENDERER_URL app://-/index.html" "${TARGET_APP}/Contents/Info.plist" >/dev/null
+
+# Patch packaged desktop metadata and updater logic inside app.asar.
+log "Patching packaged desktop bundle for GitHub release updates"
+ASAR_EXTRACT_DIR="${WORK_DIR}/asar-app"
+rm -rf "${ASAR_EXTRACT_DIR}"
+npx --yes @electron/asar extract "${TARGET_APP}/Contents/Resources/app.asar" "${ASAR_EXTRACT_DIR}"
+node "${SCRIPT_DIR}/scripts/patch-codex-desktop.mjs" \
+  "${ASAR_EXTRACT_DIR}" \
+  "${GITHUB_RELEASE_REPO}" \
+  "v${APP_VERSION}-${TARGET_ARCH_LABEL}-${RELEASE_DATE}" \
+  "${RELEASE_DATE}" \
+  "$(basename "${OUTPUT_DMG}")" \
+  "${TARGET_ARCH_LABEL}"
+npx --yes @electron/asar pack "${ASAR_EXTRACT_DIR}" "${TARGET_APP}/Contents/Resources/app.asar"
 
 # Rebuild native modules against Electron x64 ABI.
 log "Rebuilding native modules for Electron ${ELECTRON_VERSION} x64"
@@ -315,14 +375,14 @@ install -m 755 "${CLI_X64_BIN}" "${TARGET_APP}/Contents/Resources/app.asar.unpac
 install -m 755 "${RG_X64_BIN}" "${TARGET_APP}/Contents/Resources/rg"
 
 # Sparkle native addon is arm64-only in this flow; disable it.
-log "Disabling incompatible Sparkle native addon"
+log "Disabling incompatible Sparkle native addon in favor of GitHub release updater"
 rm -f "${TARGET_APP}/Contents/Resources/native/sparkle.node"
 rm -f "${TARGET_APP}/Contents/Resources/app.asar.unpacked/native/sparkle.node"
 
 # Sanity-check key binaries before signing/packaging.
 log "Validating key binaries are x86_64"
 for binary in \
-  "${TARGET_APP}/Contents/MacOS/Electron" \
+  "${TARGET_APP}/Contents/MacOS/${APP_EXECUTABLE}" \
   "${TARGET_APP}/Contents/Resources/codex" \
   "${TARGET_APP}/Contents/Resources/rg" \
   "${TARGET_APP}/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
@@ -351,6 +411,7 @@ log "Packaging release scripts: ${SCRIPT_RELEASE_ARCHIVE}"
 rm -f "${SCRIPT_RELEASE_ARCHIVE}"
 mkdir -p "${SCRIPT_RELEASE_DIR}"
 install -m 755 "${SCRIPT_DIR}/build-intel.sh" "${SCRIPT_RELEASE_DIR}/build-intel.sh"
+install -m 755 "${SCRIPT_DIR}/scripts/patch-codex-desktop.mjs" "${SCRIPT_RELEASE_DIR}/patch-codex-desktop.mjs"
 cp "${SCRIPT_DIR}/README.md" "${SCRIPT_RELEASE_DIR}/README.md"
 cp "${SCRIPT_DIR}/package.json" "${SCRIPT_RELEASE_DIR}/package.json"
 cp "${SCRIPT_DIR}/.gitignore" "${SCRIPT_RELEASE_DIR}/.gitignore"
