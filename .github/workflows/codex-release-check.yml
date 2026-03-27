@@ -1,0 +1,62 @@
+name: Codex Intel Release Check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * *'
+      timezone: 'Asia/Shanghai'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-intel-release-check
+  cancel-in-progress: false
+
+jobs:
+  check-and-release:
+    runs-on: macos-15-intel
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run scheduled Codex check
+        id: release_check
+        shell: bash
+        run: ./scripts/check-codex-release.sh
+
+      - name: Commit and push release tracking files
+        if: github.ref_name == 'main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/codex-release-state.env docs/release-checks/history.tsv
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "${{ steps.release_check.outputs.commit_message }}"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              exit 1
+            fi
+            git fetch origin main
+            git rebase origin/main || {
+              git rebase --abort || true
+              sleep $((attempt * 5))
+              continue
+            }
+            sleep $((attempt * 5))
+          done
