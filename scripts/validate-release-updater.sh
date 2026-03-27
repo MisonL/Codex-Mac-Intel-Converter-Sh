@@ -84,7 +84,11 @@ EOF
 
 main() {
   local original_app=""
-  original_app="$(find_original_app)"
+  original_app="$(find_original_app || true)"
+  [[ -n "${original_app}" ]] || {
+    echo "No original Codex.app found. Mount the installer DMG or update ORIGINAL_APP_CANDIDATES." >&2
+    exit 1
+  }
   [[ -d "${ELECTRON_APP}" ]] || {
     echo "Missing Electron runtime for validation: ${ELECTRON_APP}" >&2
     exit 1

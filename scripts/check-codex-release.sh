@@ -114,7 +114,10 @@ trap cleanup EXIT
 
 download_source_dmg() {
   mkdir -p "${WORK_DIR}" "${MOUNT_POINT}"
-  curl --fail --location --silent --show-error "${SOURCE_DMG_URL}" --output "${DOWNLOADED_DMG}"
+  curl --fail --location --silent --show-error \
+    --connect-timeout 30 --max-time 600 \
+    --retry 3 --retry-delay 5 --retry-all-errors \
+    "${SOURCE_DMG_URL}" --output "${DOWNLOADED_DMG}"
   shasum -a 256 "${DOWNLOADED_DMG}" | awk '{print $1}'
 }
 
