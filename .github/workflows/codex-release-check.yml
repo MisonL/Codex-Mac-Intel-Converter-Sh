@@ -3,11 +3,14 @@ name: Codex Intel Release Check
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 9 * * *'
-      timezone: 'Asia/Shanghai'
+    # GitHub Actions schedule is evaluated in UTC.
+    - cron: '0 1 * * *'
 
 permissions:
   contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
   group: codex-intel-release-check

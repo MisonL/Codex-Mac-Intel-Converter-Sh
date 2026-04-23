@@ -101,7 +101,9 @@
    - 工作流文件：
      - [.github/workflows/codex-release-check.yml](/Volumes/Work/code/Codex-Mac-Intel-Converter-Sh/.github/workflows/codex-release-check.yml)
    - 当前调度：
-     - 每天 `09:00` `Asia/Shanghai`
+     - 每天 `09:00` `Asia/Shanghai`，在 GitHub Actions cron 中对应 `01:00` `UTC`
+   - 运行前提：
+     - 显式设置 `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`，避免 JavaScript actions 的 Node 20 弃用警告
    - 真实运行：
      - Run ID: `23646890570`
      - Conclusion: `success`

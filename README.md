@@ -55,8 +55,9 @@ Or:
 ## Automation
 
 - GitHub Actions workflow: `.github/workflows/codex-release-check.yml`
-- Schedule: every day at `09:00` Asia/Shanghai
+- Schedule: every day at `09:00` Asia/Shanghai (`01:00` UTC in GitHub Actions cron)
 - Source DMG: `https://persistent.oaistatic.com/codex-app-prod/Codex.dmg`
 - Tracking state: `.github/codex-release-state.env`
 - Check history: `docs/release-checks/history.tsv`
+- Duplicate suppression is SHA-aware. A same-version upstream DMG with a new sha256 will still produce a new release.
 - State/history commits are only pushed automatically when the workflow runs on `main`

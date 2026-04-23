@@ -142,21 +142,24 @@ read_source_version() {
   printf '%s\n' "${version}"
 }
 
-find_existing_release_for_version() {
+find_existing_release_for_artifact() {
   local version="$1"
+  local sha256="$2"
 
   gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | python3 -c '
 import json
 import sys
 
 version = sys.argv[1]
+sha256 = sys.argv[2]
 prefix = f"v{version}-x64-"
 for release in json.load(sys.stdin):
     tag = release.get("tag_name", "")
-    if tag.startswith(prefix):
+    body = release.get("body", "")
+    if tag.startswith(prefix) and f"Source DMG sha256: {sha256}" in body:
         print(tag)
         break
-' "${version}"
+' "${version}" "${sha256}"
 }
 
 create_release() {
@@ -204,21 +207,25 @@ main() {
   source_sha256="$(download_source_dmg)"
   source_version="$(read_source_version)"
   release_tag="v${source_version}-${TARGET_ARCH_LABEL}-${RELEASE_DATE}"
-  existing_release_tag="$(find_existing_release_for_version "${source_version}" || true)"
+  existing_release_tag="$(find_existing_release_for_artifact "${source_version}" "${source_sha256}" || true)"
   emit_output "source_version" "${source_version}"
   emit_output "release_tag" "${release_tag}"
 
-  if [[ -n "${existing_release_tag}" ]]; then
-    action="no_update"
-    note="existing_release_found:${existing_release_tag}"
-    release_tag="${existing_release_tag}"
-  elif [[ "${source_version}" == "${LAST_SEEN_VERSION}" && "${source_sha256}" == "${LAST_SEEN_SHA256}" ]]; then
+  if [[ "${source_version}" == "${LAST_SEEN_VERSION}" && "${source_sha256}" == "${LAST_SEEN_SHA256}" ]]; then
     action="no_update"
     note="same_version_and_sha"
     release_tag="${LAST_RELEASE_TAG}"
+  elif [[ -n "${existing_release_tag}" ]]; then
+    action="no_update"
+    note="existing_release_found:${existing_release_tag}"
+    release_tag="${existing_release_tag}"
   else
     action="released"
-    note="new_upstream_artifact"
+    if [[ "${source_version}" == "${LAST_SEEN_VERSION}" ]]; then
+      note="same_version_new_sha"
+    else
+      note="new_upstream_artifact"
+    fi
     create_release "${source_version}" "${source_sha256}" "${release_tag}"
   fi
 
