@@ -15,6 +15,8 @@ SCRIPT_PACKAGE_PREFIX="CodexAppMacIntelBuilder"
 TARGET_ARCH_LABEL="x64"
 GITHUB_RELEASE_REPO="${GITHUB_RELEASE_REPO:-}"
 DEFAULT_GITHUB_RELEASE_REPO="MisonL/Codex-Mac-Intel-Converter-Sh"
+SOURCE_X64_APPCAST_URL="${SOURCE_X64_APPCAST_URL:-https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml}"
+OFFICIAL_X64_APP_CANDIDATES_ENV="${OFFICIAL_X64_APP_CANDIDATES:-/Applications/Codex.app}"
 
 OUTPUT_DMG=""
 SCRIPT_RELEASE_ARCHIVE=""
@@ -27,6 +29,9 @@ PATCH_SCRIPT_PATH=""
 # Runtime flags/state used by cleanup and mount logic.
 ATTACHED_BY_SCRIPT=0
 SOURCE_APP=""
+SOURCE_KIND=""
+DOWNLOADED_X64_DONOR_ZIP=""
+IFS=':' read -r -a OFFICIAL_X64_APP_CANDIDATES <<< "${OFFICIAL_X64_APP_CANDIDATES_ENV}"
 
 timestamp() {
   date "+%Y-%m-%d %H:%M:%S"
@@ -34,6 +39,10 @@ timestamp() {
 
 log() {
   printf "[%s] %s\n" "$(timestamp)" "$*"
+}
+
+log_stderr() {
+  printf "[%s] %s\n" "$(timestamp)" "$*" >&2
 }
 
 die() {
@@ -152,15 +161,328 @@ find_mounted_app_for_image() {
   '
 }
 
+find_zip_extracted_app() {
+  local search_root="$1"
+
+  find "${search_root}" -maxdepth 3 -type d -name "Codex.app" | sort | head -n 1
+}
+
+app_version_for_path() {
+  local app_path="$1"
+  local info_plist="${app_path}/Contents/Info.plist"
+  local version=""
+
+  [[ -f "${info_plist}" ]] || return 1
+  version="$(plist_get "${info_plist}" "CFBundleShortVersionString" || true)"
+  if [[ -z "${version}" ]]; then
+    version="$(plist_get "${info_plist}" "CFBundleVersion" || true)"
+  fi
+  [[ -n "${version}" ]] || return 1
+  printf '%s\n' "${version}"
+}
+
+app_executable_for_path() {
+  local app_path="$1"
+  local info_plist="${app_path}/Contents/Info.plist"
+
+  [[ -f "${info_plist}" ]] || return 1
+  plist_get "${info_plist}" "CFBundleExecutable"
+}
+
+is_x64_binary() {
+  local binary_path="$1"
+  local file_output=""
+
+  [[ -f "${binary_path}" ]] || return 1
+  file_output="$(file "${binary_path}")"
+  [[ "${file_output}" == *"x86_64"* ]]
+}
+
+resolve_input_source() {
+  local explicit_source="${1:-}"
+  local found_sources=()
+  local found_source=""
+
+  if [[ -n "${explicit_source}" ]]; then
+    if [[ -d "${explicit_source}" ]]; then
+      cd "${explicit_source}" >/dev/null 2>&1 && pwd
+      return 0
+    fi
+    cd "$(dirname "${explicit_source}")" >/dev/null 2>&1
+    printf '%s/%s\n' "$(pwd)" "$(basename "${explicit_source}")"
+    return 0
+  fi
+
+  if [[ -f "${SCRIPT_PARENT_DIR}/Codex.dmg" ]]; then
+    printf '%s\n' "${SCRIPT_PARENT_DIR}/Codex.dmg"
+    return 0
+  fi
+
+  while IFS= read -r found_source; do
+    found_sources+=("${found_source}")
+  done < <(
+    find "${SCRIPT_PARENT_DIR}" -maxdepth 1 \
+      \( -type f \( -name "*.dmg" -o -name "*.zip" \) -o -type d -name "*.app" \) \
+      ! -name "${OUTPUT_DMG_PREFIX}.dmg" \
+      ! -name "${OUTPUT_DMG_PREFIX}_*.dmg" \
+      ! -name "${SCRIPT_PACKAGE_PREFIX}_*.zip" | sort
+  )
+
+  if [[ ${#found_sources[@]} -eq 0 ]]; then
+    die "No source artifact found. Pass a Codex .dmg, .zip, or .app path explicitly."
+  fi
+  if [[ ${#found_sources[@]} -gt 1 ]]; then
+    printf '%s\n' "${found_sources[@]}"
+    die "Multiple source artifacts found. Pass the source path explicitly."
+  fi
+
+  printf '%s\n' "${found_sources[0]}"
+}
+
+prepare_source_app() {
+  local input_source="$1"
+  local zip_extract_dir=""
+  local extracted_app=""
+
+  if [[ -d "${input_source}" && "${input_source}" == *.app ]]; then
+    SOURCE_KIND="app"
+    SOURCE_APP="${input_source}"
+    return 0
+  fi
+
+  case "${input_source}" in
+    *.dmg)
+      SOURCE_KIND="dmg"
+      log "Mounting source DMG in read-only mode"
+      mkdir -p "${MOUNT_POINT}"
+      if hdiutil attach -readonly -nobrowse -mountpoint "${MOUNT_POINT}" "${input_source}" >/dev/null; then
+        ATTACHED_BY_SCRIPT=1
+        SOURCE_APP="${MOUNT_POINT}/Codex.app"
+      else
+        SOURCE_APP="$(find_mounted_app_for_image "${input_source}" || true)"
+        if [[ -d "${SOURCE_APP}" ]]; then
+          log "Using existing mounted app: ${SOURCE_APP}"
+        elif [[ -d "/Volumes/Codex Installer/Codex.app" ]]; then
+          SOURCE_APP="/Volumes/Codex Installer/Codex.app"
+          log "Using existing mounted volume: ${SOURCE_APP}"
+        else
+          die "Failed to mount DMG and no fallback mounted Codex.app found"
+        fi
+      fi
+      ;;
+    *.zip)
+      SOURCE_KIND="zip"
+      zip_extract_dir="${WORK_DIR}/source-zip"
+      mkdir -p "${zip_extract_dir}"
+      log "Extracting source ZIP"
+      ditto -x -k "${input_source}" "${zip_extract_dir}"
+      extracted_app="$(find_zip_extracted_app "${zip_extract_dir}" || true)"
+      [[ -n "${extracted_app}" ]] || die "Codex.app not found inside ZIP: ${input_source}"
+      SOURCE_APP="${extracted_app}"
+      ;;
+    *)
+      die "Unsupported source artifact: ${input_source}. Expected .dmg, .zip, or .app"
+      ;;
+  esac
+
+  [[ -d "${SOURCE_APP}" ]] || die "Codex.app not found in source artifact: ${input_source}"
+}
+
+copy_bundle() {
+  local source_path="$1"
+  local destination_path="$2"
+
+  rm -rf "${destination_path}"
+  ditto "${source_path}" "${destination_path}"
+}
+
+find_local_x64_donor_app() {
+  local source_version="$1"
+  local candidate=""
+  local candidate_version=""
+  local candidate_executable=""
+
+  for candidate in "${OFFICIAL_X64_APP_CANDIDATES[@]}"; do
+    if [[ ! -d "${candidate}" ]]; then
+      continue
+    fi
+    candidate_version="$(app_version_for_path "${candidate}" || true)"
+    [[ "${candidate_version}" == "${source_version}" ]] || continue
+    candidate_executable="$(app_executable_for_path "${candidate}" || true)"
+    [[ -n "${candidate_executable}" ]] || continue
+    if is_x64_binary "${candidate}/Contents/MacOS/${candidate_executable}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+lookup_appcast_enclosure_url() {
+  local appcast_url="$1"
+  local expected_version="$2"
+
+  python3 - "$appcast_url" "$expected_version" <<'PY'
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
+
+appcast_url = sys.argv[1]
+expected_version = sys.argv[2]
+
+request = urllib.request.Request(
+    appcast_url,
+    headers={"User-Agent": "CodexIntelBuilder/1.0"},
+)
+with urllib.request.urlopen(request, timeout=60) as response:
+    data = response.read()
+
+root = ET.fromstring(data)
+channel = root.find("channel")
+if channel is None:
+    raise SystemExit("Missing channel in appcast")
+
+for item in channel.findall("item"):
+    version = item.findtext("{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString") or item.findtext("title") or ""
+    if version != expected_version:
+        continue
+    enclosure = item.find("enclosure")
+    if enclosure is None:
+        raise SystemExit("Missing enclosure in matching appcast item")
+    url = enclosure.attrib.get("url", "").strip()
+    if not url:
+        raise SystemExit("Matching appcast item is missing enclosure URL")
+    print(url)
+    raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+download_x64_donor_zip() {
+  local source_version="$1"
+  local donor_dir="${WORK_DIR}/x64-donor"
+  local donor_zip_url=""
+  local donor_zip_path=""
+  local extracted_app=""
+
+  donor_zip_url="$(lookup_appcast_enclosure_url "${SOURCE_X64_APPCAST_URL}" "${source_version}" || true)"
+  [[ -n "${donor_zip_url}" ]] || die "Cannot find matching x64 donor ZIP for version ${source_version} in ${SOURCE_X64_APPCAST_URL}"
+
+  mkdir -p "${donor_dir}"
+  donor_zip_path="${donor_dir}/$(basename "${donor_zip_url}")"
+  DOWNLOADED_X64_DONOR_ZIP="${donor_zip_path}"
+  log_stderr "Downloading matching x64 donor ZIP: ${donor_zip_url}"
+  curl --fail --location --silent --show-error \
+    --connect-timeout 30 --max-time 900 \
+    --retry 3 --retry-delay 5 --retry-all-errors \
+    "${donor_zip_url}" --output "${donor_zip_path}"
+
+  log_stderr "Extracting x64 donor ZIP"
+  ditto -x -k "${donor_zip_path}" "${donor_dir}/unzipped"
+  extracted_app="$(find_zip_extracted_app "${donor_dir}/unzipped" || true)"
+  [[ -n "${extracted_app}" ]] || die "Codex.app not found inside donor ZIP: ${donor_zip_path}"
+  printf '%s\n' "${extracted_app}"
+}
+
+prepare_x64_donor_app() {
+  local source_version="$1"
+  local donor_app=""
+
+  donor_app="$(find_local_x64_donor_app "${source_version}" || true)"
+  if [[ -n "${donor_app}" ]]; then
+    log_stderr "Using local x64 donor app: ${donor_app}"
+    printf '%s\n' "${donor_app}"
+    return 0
+  fi
+
+  donor_app="$(download_x64_donor_zip "${source_version}")"
+  [[ -n "${donor_app}" ]] || die "Failed to prepare x64 donor app for version ${source_version}"
+  log_stderr "Using downloaded x64 donor app: ${donor_app}"
+  printf '%s\n' "${donor_app}"
+}
+
+sync_path_from_donor() {
+  local donor_app="$1"
+  local relative_path="$2"
+  local donor_path="${donor_app}/${relative_path}"
+  local target_path="${TARGET_APP}/${relative_path}"
+
+  [[ -e "${donor_path}" ]] || die "Missing donor path: ${donor_path}"
+  rm -rf "${target_path}"
+  mkdir -p "$(dirname "${target_path}")"
+  ditto "${donor_path}" "${target_path}"
+}
+
+sync_x64_donor_resources() {
+  local donor_app="$1"
+  local donor_version=""
+
+  donor_version="$(app_version_for_path "${donor_app}" || true)"
+  [[ "${donor_version}" == "${APP_VERSION_RAW}" ]] || die "Donor app version mismatch: expected ${APP_VERSION_RAW}, got ${donor_version:-<empty>}"
+
+  log "Syncing x64 donor resources from official Intel build"
+  sync_path_from_donor "${donor_app}" "Contents/Resources/node"
+  sync_path_from_donor "${donor_app}" "Contents/Resources/node_repl"
+  sync_path_from_donor "${donor_app}" "Contents/Resources/native"
+  sync_path_from_donor "${donor_app}" "Contents/Resources/plugins"
+
+  rm -f "${TARGET_APP}/Contents/Resources/codex_chronicle"
+  rm -f "${TARGET_APP}/Contents/Resources/app.asar.unpacked/codex_chronicle"
+}
+
+assert_no_arm64_only_binary() {
+  local binary_path="$1"
+  local file_output=""
+
+  [[ -e "${binary_path}" ]] || return 0
+  file_output="$(file "${binary_path}")"
+  echo "${file_output}"
+  if [[ "${file_output}" == *"Mach-O"* && "${file_output}" == *"arm64"* && "${file_output}" != *"x86_64"* ]]; then
+    die "Found arm64-only binary in Intel output: ${binary_path}"
+  fi
+}
+
+validate_target_architecture() {
+  local binary=""
+  local plugin_binary=""
+
+  log "Validating key binaries are usable on x86_64"
+  for binary in \
+    "${TARGET_APP}/Contents/MacOS/${APP_EXECUTABLE}" \
+    "${TARGET_APP}/Contents/Resources/codex" \
+    "${TARGET_APP}/Contents/Resources/rg" \
+    "${TARGET_APP}/Contents/Resources/node" \
+    "${TARGET_APP}/Contents/Resources/node_repl" \
+    "${TARGET_APP}/Contents/Resources/native/launch-services-helper" \
+    "${TARGET_APP}/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
+    "${TARGET_APP}/Contents/Resources/app.asar.unpacked/node_modules/node-pty/build/Release/pty.node"; do
+    assert_no_arm64_only_binary "${binary}"
+  done
+
+  if [[ -d "${TARGET_APP}/Contents/Resources/plugins" ]]; then
+    while IFS= read -r plugin_binary; do
+      assert_no_arm64_only_binary "${plugin_binary}"
+    done < <(
+      find "${TARGET_APP}/Contents/Resources/plugins" -type f \
+        \( -perm -111 -o -name "*.node" \) | sort
+    )
+  fi
+
+  [[ ! -e "${TARGET_APP}/Contents/Resources/codex_chronicle" ]] || die "Unexpected codex_chronicle residue found in Intel output"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
-  ./build-intel.sh [path/to/Codex.dmg]
+  ./build-intel.sh [path/to/Codex.dmg|path/to/Codex.zip|path/to/Codex.app]
 
 Behavior:
-  - Reads source DMG from ../Codex.dmg by default (or explicit path argument)
-  - Never modifies the original DMG
+  - Accepts source Codex .dmg, .zip, or .app
+  - Never modifies the original source artifact
   - Uses .tmp/* for all build steps
+  - Uses a matching official x64 donor app to replace arm64-only runtime resources
   - Writes full logs to log.txt
   - Produces release-named DMG and script bundle artifacts
 EOF
@@ -169,7 +491,6 @@ EOF
 cleanup() {
   local exit_code=$?
 
-  # Detach only if this script mounted the DMG itself.
   if [[ "${ATTACHED_BY_SCRIPT}" -eq 1 && -d "${MOUNT_POINT}" ]]; then
     hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || hdiutil detach -force "${MOUNT_POINT}" >/dev/null 2>&1 || true
   fi
@@ -197,7 +518,7 @@ GITHUB_RELEASE_REPO="$(derive_github_release_repo)"
 log "GitHub release repo: ${GITHUB_RELEASE_REPO}"
 
 # Validate required tools early.
-for cmd in hdiutil ditto npm npx node file codesign xattr; do
+for cmd in curl ditto file codesign hdiutil node npm npx python3 xattr; do
   command -v "${cmd}" >/dev/null 2>&1 || die "Missing required command: ${cmd}"
 done
 
@@ -211,56 +532,13 @@ if [[ $# -gt 1 ]]; then
   die "Too many arguments"
 fi
 
-# Resolve source DMG path:
-# 1) explicit argument
-# 2) ../Codex.dmg
-# 3) single *.dmg in parent directory (if present)
-if [[ $# -eq 1 ]]; then
-  INPUT_DMG="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
-else
-  if [[ -f "${SCRIPT_PARENT_DIR}/Codex.dmg" ]]; then
-    INPUT_DMG="${SCRIPT_PARENT_DIR}/Codex.dmg"
-  else
-    found_dmgs=()
-    while IFS= read -r found_dmg; do
-      found_dmgs+=("${found_dmg}")
-    done < <(
-      find "${SCRIPT_PARENT_DIR}" -maxdepth 1 -type f -name "*.dmg" \
-        ! -name "${OUTPUT_DMG_PREFIX}.dmg" \
-        ! -name "${OUTPUT_DMG_PREFIX}_*.dmg" | sort
-    )
-    if [[ ${#found_dmgs[@]} -eq 0 ]]; then
-      die "No source DMG found. Put Codex.dmg next to this repo folder (../Codex.dmg) or pass a path."
-    fi
-    if [[ ${#found_dmgs[@]} -gt 1 ]]; then
-      printf '%s\n' "${found_dmgs[@]}"
-      die "Multiple DMGs found. Pass source DMG path explicitly."
-    fi
-    INPUT_DMG="${found_dmgs[0]}"
-  fi
-fi
+INPUT_SOURCE="$(resolve_input_source "${1:-}")"
+[[ -e "${INPUT_SOURCE}" ]] || die "Source artifact not found: ${INPUT_SOURCE}"
+log "Source artifact: ${INPUT_SOURCE}"
 
-[[ -f "${INPUT_DMG}" ]] || die "Source DMG not found: ${INPUT_DMG}"
-log "Source DMG: ${INPUT_DMG}"
-
-# Mount source DMG in read-only mode.
-log "Mounting source DMG in read-only mode"
-mkdir -p "${MOUNT_POINT}"
-if hdiutil attach -readonly -nobrowse -mountpoint "${MOUNT_POINT}" "${INPUT_DMG}" >/dev/null; then
-  ATTACHED_BY_SCRIPT=1
-  SOURCE_APP="${MOUNT_POINT}/Codex.app"
-else
-  SOURCE_APP="$(find_mounted_app_for_image "${INPUT_DMG}" || true)"
-  if [[ -d "${SOURCE_APP}" ]]; then
-    log "Using existing mounted app: ${SOURCE_APP}"
-  elif [[ -d "/Volumes/Codex Installer/Codex.app" ]]; then
-    SOURCE_APP="/Volumes/Codex Installer/Codex.app"
-    log "Using existing mounted volume: ${SOURCE_APP}"
-  else
-    die "Failed to mount DMG and no fallback mounted Codex.app found"
-  fi
-fi
-[[ -d "${SOURCE_APP}" ]] || die "Codex.app not found inside DMG"
+prepare_source_app "${INPUT_SOURCE}"
+log "Source kind: ${SOURCE_KIND}"
+log "Source app: ${SOURCE_APP}"
 
 ORIG_APP="${WORK_DIR}/CodexOriginal.app"
 TARGET_APP="${WORK_DIR}/Codex.app"
@@ -268,9 +546,9 @@ BUILD_PROJECT="${WORK_DIR}/build-project"
 DMG_ROOT="${WORK_DIR}/dmg-root"
 SCRIPT_RELEASE_DIR=""
 
-# Copy app bundle from mounted DMG to local writable work dir.
+# Copy app bundle from source to local writable work dir.
 log "Copying source app bundle to work dir"
-ditto "${SOURCE_APP}" "${ORIG_APP}"
+copy_bundle "${SOURCE_APP}" "${ORIG_APP}"
 
 APP_INFO_PLIST="${ORIG_APP}/Contents/Info.plist"
 [[ -f "${APP_INFO_PLIST}" ]] || die "Cannot read source app info plist"
@@ -349,7 +627,7 @@ EOF
 
 # Use Electron x64 app template as the destination runtime.
 log "Creating Intel app bundle from Electron runtime"
-ditto "${BUILD_PROJECT}/node_modules/electron/dist/Electron.app" "${TARGET_APP}"
+copy_bundle "${BUILD_PROJECT}/node_modules/electron/dist/Electron.app" "${TARGET_APP}"
 
 # Convert the default Electron runtime shell into a packaged Codex app shell.
 log "Renaming Electron runtime shell to ${APP_EXECUTABLE}"
@@ -360,13 +638,16 @@ rename_helper_app "Electron Helper (GPU)" "${APP_EXECUTABLE} Helper (GPU)" "help
 rename_helper_app "Electron Helper (Plugin)" "${APP_EXECUTABLE} Helper (Plugin)" "helper.plugin"
 
 # Inject original Codex metadata and resources into the packaged x64 runtime shell.
-log "Injecting Codex resources from original app"
+log "Injecting Codex resources from source app"
 rm -rf "${TARGET_APP}/Contents/Resources"
-ditto "${ORIG_APP}/Contents/Resources" "${TARGET_APP}/Contents/Resources"
+copy_bundle "${ORIG_APP}/Contents/Resources" "${TARGET_APP}/Contents/Resources"
 cp "${ORIG_APP}/Contents/Info.plist" "${TARGET_APP}/Contents/Info.plist"
-# Keep the packaged renderer on bundled assets even after switching the runtime shell.
 /usr/libexec/PlistBuddy -c "Add :LSEnvironment:ELECTRON_RENDERER_URL string app://-/index.html" "${TARGET_APP}/Contents/Info.plist" >/dev/null 2>&1 || \
   /usr/libexec/PlistBuddy -c "Set :LSEnvironment:ELECTRON_RENDERER_URL app://-/index.html" "${TARGET_APP}/Contents/Info.plist" >/dev/null
+
+# Replace arm64-only runtime resources with a matching official Intel donor build.
+X64_DONOR_APP="$(prepare_x64_donor_app "${APP_VERSION_RAW}")"
+sync_x64_donor_resources "${X64_DONOR_APP}"
 
 # Patch packaged desktop metadata and updater logic inside app.asar.
 log "Patching packaged desktop bundle for GitHub release updates"
@@ -406,7 +687,6 @@ if [[ -n "${NODE_PTY_BIN_SRC}" ]]; then
   mkdir -p "${TARGET_UNPACKED}/node_modules/node-pty/bin/darwin-x64-143"
   install -m 755 "${NODE_PTY_BIN_SRC}" "${TARGET_UNPACKED}/node_modules/node-pty/bin/darwin-x64-143/node-pty.node"
   if [[ -f "${TARGET_UNPACKED}/node_modules/node-pty/bin/darwin-arm64-143/node-pty.node" ]]; then
-    # Keep hardcoded/fallback load paths functional even if the app references arm64 folder.
     install -m 755 "${NODE_PTY_BIN_SRC}" "${TARGET_UNPACKED}/node_modules/node-pty/bin/darwin-arm64-143/node-pty.node"
   fi
 fi
@@ -417,45 +697,33 @@ RG_X64_BIN="${CLI_X64_ROOT}/path/rg"
 [[ -f "${CLI_X64_BIN}" ]] || die "x64 Codex CLI binary not found after npm install"
 [[ -f "${RG_X64_BIN}" ]] || die "x64 rg binary not found after npm install"
 
-# Replace bundled arm64 codex/rg command-line binaries.
 log "Replacing bundled codex/rg binaries with x64 versions"
 install -m 755 "${CLI_X64_BIN}" "${TARGET_APP}/Contents/Resources/codex"
 install -m 755 "${CLI_X64_BIN}" "${TARGET_APP}/Contents/Resources/app.asar.unpacked/codex"
 install -m 755 "${RG_X64_BIN}" "${TARGET_APP}/Contents/Resources/rg"
 
-# Sparkle native addon is arm64-only in this flow; disable it.
-log "Disabling incompatible Sparkle native addon in favor of GitHub release updater"
+log "Removing non-runtime debug symbol bundles"
+find "${TARGET_APP}/Contents/Resources" -type d -name "*.dSYM" -prune -exec rm -rf {} +
+
+# Sparkle native addon is still routed through GitHub release updater in this repo.
+log "Disabling bundled Sparkle native addon in favor of GitHub release updater"
 rm -f "${TARGET_APP}/Contents/Resources/native/sparkle.node"
 rm -f "${TARGET_APP}/Contents/Resources/app.asar.unpacked/native/sparkle.node"
 
-# Sanity-check key binaries before signing/packaging.
-log "Validating key binaries are x86_64"
-for binary in \
-  "${TARGET_APP}/Contents/MacOS/${APP_EXECUTABLE}" \
-  "${TARGET_APP}/Contents/Resources/codex" \
-  "${TARGET_APP}/Contents/Resources/rg" \
-  "${TARGET_APP}/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node" \
-  "${TARGET_APP}/Contents/Resources/app.asar.unpacked/node_modules/node-pty/build/Release/pty.node"; do
-  file_output="$(file "${binary}")"
-  echo "${file_output}"
-  [[ "${file_output}" == *"x86_64"* ]] || die "Expected x86_64 binary: ${binary}"
-done
+validate_target_architecture
 
-# Re-sign modified app ad-hoc to satisfy macOS code integrity checks.
 log "Signing app ad-hoc"
 xattr -cr "${TARGET_APP}" || true
 codesign --force --deep --sign - --timestamp=none "${TARGET_APP}"
 codesign --verify --deep --strict "${TARGET_APP}"
 
-# Build final distributable DMG.
 log "Building output DMG: ${OUTPUT_DMG}"
 rm -f "${OUTPUT_DMG}"
 mkdir -p "${DMG_ROOT}"
-ditto "${TARGET_APP}" "${DMG_ROOT}/Codex.app"
+copy_bundle "${TARGET_APP}" "${DMG_ROOT}/Codex.app"
 ln -s /Applications "${DMG_ROOT}/Applications"
 hdiutil create -volname "Codex App Mac Intel" -srcfolder "${DMG_ROOT}" -ov -format UDZO "${OUTPUT_DMG}" >/dev/null
 
-# Package the release script set with matching version/date naming.
 log "Packaging release scripts: ${SCRIPT_RELEASE_ARCHIVE}"
 rm -f "${SCRIPT_RELEASE_ARCHIVE}"
 mkdir -p "${SCRIPT_RELEASE_DIR}"
